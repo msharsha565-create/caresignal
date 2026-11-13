@@ -6,6 +6,7 @@ call, so the same tools serve Claude Desktop / Claude Code unchanged.
 Providers:
   CARESIGNAL_PROVIDER=anthropic (default)  -> Claude API (ANTHROPIC_API_KEY)
   CARESIGNAL_PROVIDER=bedrock              -> Amazon Bedrock (AWS credentials/role)
+  CARESIGNAL_PROVIDER=gemini               -> Google Gemini API (GEMINI_API_KEY; has a free tier)
 """
 from __future__ import annotations
 
@@ -19,7 +20,10 @@ from anthropic.lib.tools.mcp import async_mcp_tool
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+PROVIDER = os.environ.get("CARESIGNAL_PROVIDER", "anthropic").lower()
 MODEL = os.environ.get("CARESIGNAL_MODEL", "claude-opus-5-5")
+GEMINI_MODEL = os.environ.get("CARESIGNAL_GEMINI_MODEL", "gemini-flash-latest")
+MAX_TOOL_ROUNDS = 12
 MAX_HISTORY_MESSAGES = 40
 
 SYSTEM_PROMPT = """You are CareSignal, a discharge-planning assistant for hospital care teams \
@@ -53,7 +57,7 @@ class AgentReply:
 
 def make_client() -> tuple[anthropic.AsyncAnthropic, str, bool]:
     """Return (client, model id, is_first_party)."""
-    if os.environ.get("CARESIGNAL_PROVIDER", "anthropic").lower() == "bedrock":
+    if PROVIDER == "bedrock":
         from anthropic import AsyncAnthropicBedrockMantle
 
         region = os.environ.get("AWS_REGION", "us-east-1")
@@ -64,10 +68,18 @@ def make_client() -> tuple[anthropic.AsyncAnthropic, str, bool]:
 class CareSignalAgent:
     """Holds one MCP stdio session for the life of the process."""
 
-    def __init__(self, client: anthropic.AsyncAnthropic | None = None) -> None:
+    def __init__(self, client=None, provider: str = PROVIDER) -> None:
+        """`client` lets tests inject a stubbed SDK client for `provider`."""
+        if provider not in ("anthropic", "bedrock", "gemini"):
+            raise ValueError(f"Unknown CARESIGNAL_PROVIDER {provider!r}")
         self._stack = AsyncExitStack()
+        self._session: ClientSession | None = None
+        self._mcp_tools: list = []
         self._tools: list = []
-        if client is not None:  # injected (tests)
+        self._gemini = provider == "gemini"
+        if self._gemini:
+            self._client, self._model, self._first_party = client, GEMINI_MODEL, False
+        elif client is not None:
             self._client, self._model, self._first_party = client, MODEL, True
         else:
             self._client, self._model, self._first_party = make_client()
@@ -79,7 +91,9 @@ class CareSignalAgent:
         read, write = await self._stack.enter_async_context(stdio_client(params))
         session = await self._stack.enter_async_context(ClientSession(read, write))
         await session.initialize()
-        self._tools = [async_mcp_tool(t, session) for t in (await session.list_tools()).tools]
+        self._session = session
+        self._mcp_tools = (await session.list_tools()).tools
+        self._tools = [async_mcp_tool(t, session) for t in self._mcp_tools]
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -87,11 +101,13 @@ class CareSignalAgent:
 
     @property
     def tool_names(self) -> list[str]:
-        return [t.name for t in self._tools]
+        return [t.name for t in self._mcp_tools]
 
     async def chat(self, messages: list[dict]) -> AgentReply:
         """Run one user turn. `messages` is the text-only conversation so far,
         ending with the user's newest message."""
+        if self._gemini:
+            return await self._chat_gemini(messages[-MAX_HISTORY_MESSAGES:])
         extra: dict = {}
         if self._first_party:
             # If a safety classifier declines, let the API retry on a fallback
@@ -106,7 +122,7 @@ class CareSignalAgent:
             output_config={"effort": "medium"},
             tools=self._tools,
             messages=messages[-MAX_HISTORY_MESSAGES:],
-            max_iterations=12,
+            max_iterations=MAX_TOOL_ROUNDS,
             **extra,
         )
 
@@ -137,6 +153,81 @@ class CareSignalAgent:
         if last.stop_reason == "max_tokens":
             text += "\n\n(Response was cut off at the length limit.)"
         return AgentReply(text or "(No answer produced.)", tool_calls, last.model)
+
+
+    async def _chat_gemini(self, messages: list[dict]) -> AgentReply:
+        """Same agent on Google Gemini: a manual tool loop over the MCP session."""
+        from google import genai
+        from google.genai import errors, types
+
+        if self._client is None:
+            try:
+                self._client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
+            except ValueError as e:
+                raise AgentUnavailable("LLM credentials are not configured (set GEMINI_API_KEY).") from e
+
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=[
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=t.name, description=t.description, parameters_json_schema=t.input_schema
+                        )
+                        for t in self._mcp_tools
+                    ]
+                )
+            ],
+            # We run the tools ourselves so every call goes through MCP and is recorded.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        contents = [
+            types.Content(role="model" if m["role"] == "assistant" else "user", parts=[types.Part(text=m["content"])])
+            for m in messages
+        ]
+        tool_calls: list[dict] = []
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            try:
+                resp = await self._client.aio.models.generate_content(
+                    model=self._model, contents=contents, config=config
+                )
+            except errors.ClientError as e:
+                if e.code == 429:
+                    raise AgentUnavailable("The LLM is rate limited (free-tier quota); try again shortly.") from e
+                if e.code in (401, 403) or "API key" in str(e):
+                    raise AgentUnavailable("LLM credentials are missing or invalid.") from e
+                raise AgentUnavailable(f"LLM request failed ({e.code}).") from e
+            except errors.APIError as e:
+                raise AgentUnavailable(f"LLM request failed ({e.code}).") from e
+
+            candidate = resp.candidates[0] if resp.candidates else None
+            if candidate is None or candidate.content is None or not candidate.content.parts:
+                # Blocked by a safety filter, or an empty completion.
+                return AgentReply("I can't help with that request.", tool_calls, self._model, refused=True)
+
+            calls = resp.function_calls or []
+            if not calls:
+                text = "".join(p.text for p in candidate.content.parts if p.text and not p.thought).strip()
+                return AgentReply(text or "(No answer produced.)", tool_calls, self._model)
+
+            # Echo the model turn back unchanged (it carries thought signatures).
+            contents.append(candidate.content)
+            results = []
+            for call in calls:
+                args = dict(call.args or {})
+                tool_calls.append({"name": call.name, "input": args})
+                result = await self._session.call_tool(call.name, args)
+                text = "\n".join(c.text for c in result.content if getattr(c, "text", None))
+                payload = {"error": text} if result.is_error else {"result": text}
+                results.append(
+                    types.Part(function_response=types.FunctionResponse(id=call.id, name=call.name, response=payload))
+                )
+            contents.append(types.Content(role="user", parts=results))
+
+        return AgentReply(
+            "I ran out of tool steps before finishing; try a narrower question.", tool_calls, self._model
+        )
 
 
 async def _repl() -> None:

@@ -27,7 +27,7 @@ interactions, and answers questions about the cohort in plain language.
 | Synthetic cohort, feature pipeline | NumPy, pandas | `caresignal/data.py`, `caresignal/model.py` |
 | Readmission risk model + per-patient drivers | PyTorch | `caresignal/model.py` |
 | Clinical tools (patients, risk, interactions, cohort stats) | MCP server | `caresignal/mcp_server.py` |
-| Agent | Claude (`claude-opus-5-5`) via the Anthropic SDK tool runner, as an MCP client | `caresignal/agent.py` |
+| Agent | Claude (`claude-opus-5-5`) via the Anthropic SDK tool runner, as an MCP client; Amazon Bedrock and Google Gemini are switchable providers | `caresignal/agent.py` |
 | REST API | FastAPI | `caresignal/api.py` |
 | Web app | TypeScript, React, Vite | `web/` |
 | Independent model validation | R (base only) | `r/analysis.R` |
@@ -58,6 +58,16 @@ npm --prefix web install && npm --prefix web run build
 export ANTHROPIC_API_KEY=...      # needed only for the chat panel
 uvicorn caresignal.api:app --port 8000
 ```
+
+To use Google Gemini instead (it has a free tier; create a key in Google AI Studio):
+
+```bash
+export CARESIGNAL_PROVIDER=gemini GEMINI_API_KEY=...
+uvicorn caresignal.api:app --port 8000
+```
+
+Free-tier Gemini is rate limited, and Google's free-tier terms allow prompts to be used to
+improve their products, so keep it to synthetic data.
 
 Open http://localhost:8000. Without an API key the patient list, risk drivers and
 medication checks all work; the chat panel reports that the LLM is not configured.

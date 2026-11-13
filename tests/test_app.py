@@ -131,3 +131,38 @@ async def test_agent_loop_with_stubbed_llm(svc):
     assert len(seen[0]["tools"]) == 6 and seen[0]["model"] == "claude-opus-5-5"
     tool_result = seen[1]["messages"][-1]["content"][0]
     assert tool_result["type"] == "tool_result" and pid in json.dumps(tool_result["content"])
+
+
+@pytest.mark.anyio
+async def test_gemini_agent_loop_with_stubbed_llm(svc):
+    """Gemini provider: real MCP server, stubbed Gemini client."""
+    from types import SimpleNamespace
+
+    from google.genai import types
+
+    from caresignal.agent import CareSignalAgent
+
+    pid = svc.list_patients(limit=1)[0]["patient_id"]
+    seen: list[dict] = []
+
+    def response(part):
+        return types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(role="model", parts=[part]))]
+        )
+
+    async def generate_content(*, model, contents, config):
+        seen.append({"model": model, "contents": list(contents), "config": config})
+        if len(seen) == 1:
+            return response(types.Part(function_call=types.FunctionCall(
+                id="c1", name="check_patient_medications", args={"patient_id": pid})))
+        return response(types.Part(text="No major interactions."))
+
+    stub = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
+    async with CareSignalAgent(stub, provider="gemini") as agent:
+        reply = await agent.chat([{"role": "user", "content": f"Meds for {pid}?"}])
+
+    assert reply.text == "No major interactions."
+    assert reply.tool_calls == [{"name": "check_patient_medications", "input": {"patient_id": pid}}]
+    assert len(seen[0]["config"].tools[0].function_declarations) == 6
+    fr = seen[1]["contents"][-1].parts[0].function_response
+    assert fr.name == "check_patient_medications" and fr.id == "c1" and pid in fr.response["result"]
