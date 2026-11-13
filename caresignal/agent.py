@@ -161,10 +161,9 @@ class CareSignalAgent:
         from google.genai import errors, types
 
         if self._client is None:
-            try:
-                self._client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
-            except ValueError as e:
-                raise AgentUnavailable("LLM credentials are not configured (set GEMINI_API_KEY).") from e
+            if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+                raise AgentUnavailable("LLM credentials are not configured (set GEMINI_API_KEY).")
+            self._client = genai.Client()
 
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
