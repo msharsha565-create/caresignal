@@ -10,19 +10,23 @@ Providers:
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 
 import anthropic
+import httpx
 from anthropic.lib.tools.mcp import async_mcp_tool
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 PROVIDER = os.environ.get("CARESIGNAL_PROVIDER", "anthropic").lower()
 MODEL = os.environ.get("CARESIGNAL_MODEL", "claude-opus-5-5")
-GEMINI_MODEL = os.environ.get("CARESIGNAL_GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = os.environ.get("CARESIGNAL_GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_ROUNDS = 12
 MAX_HISTORY_MESSAGES = 40
 
@@ -156,73 +160,68 @@ class CareSignalAgent:
 
 
     async def _chat_gemini(self, messages: list[dict]) -> AgentReply:
-        """Same agent on Google Gemini: a manual tool loop over the MCP session."""
-        from google import genai
-        from google.genai import errors, types
-
+        """Same agent on Google Gemini (OpenAI-compatible endpoint): a manual
+        tool loop over the MCP session."""
         if self._client is None:
-            if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if not key:
                 raise AgentUnavailable("LLM credentials are not configured (set GEMINI_API_KEY).")
-            self._client = genai.Client()
+            self._client = await self._stack.enter_async_context(
+                httpx.AsyncClient(base_url=GEMINI_BASE_URL, headers={"Authorization": f"Bearer {key}"}, timeout=180)
+            )
 
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            tools=[
-                types.Tool(
-                    function_declarations=[
-                        types.FunctionDeclaration(
-                            name=t.name, description=t.description, parameters_json_schema=t.input_schema
-                        )
-                        for t in self._mcp_tools
-                    ]
-                )
-            ],
-            # We run the tools ourselves so every call goes through MCP and is recorded.
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        )
-        contents = [
-            types.Content(role="model" if m["role"] == "assistant" else "user", parts=[types.Part(text=m["content"])])
-            for m in messages
+        tools = [
+            {"type": "function",
+             "function": {"name": t.name, "description": t.description or "", "parameters": t.input_schema}}
+            for t in self._mcp_tools
         ]
+        convo: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
         tool_calls: list[dict] = []
 
         for _ in range(MAX_TOOL_ROUNDS):
-            try:
-                resp = await self._client.aio.models.generate_content(
-                    model=self._model, contents=contents, config=config
-                )
-            except errors.ClientError as e:
-                if e.code == 429:
-                    raise AgentUnavailable("The LLM is rate limited (free-tier quota); try again shortly.") from e
-                if e.code in (401, 403) or "API key" in str(e):
-                    raise AgentUnavailable("LLM credentials are missing or invalid.") from e
-                raise AgentUnavailable(f"LLM request failed ({e.code}).") from e
-            except errors.APIError as e:
-                raise AgentUnavailable(f"LLM request failed ({e.code}).") from e
+            for attempt in range(4):  # ride out brief "high demand" 5xx responses
+                try:
+                    resp = await self._client.post(
+                        "chat/completions", json={"model": self._model, "messages": convo, "tools": tools}
+                    )
+                except httpx.HTTPError as e:
+                    raise AgentUnavailable("Could not reach the LLM service.") from e
+                if resp.status_code < 500 or attempt == 3:
+                    break
+                await asyncio.sleep(2 * 2**attempt)
+            if resp.status_code >= 500:
+                raise AgentUnavailable("The LLM service is overloaded right now; try again in a minute.")
+            if resp.status_code == 429:
+                raise AgentUnavailable("The LLM is rate limited (free-tier quota); try again shortly.")
+            if resp.status_code in (401, 403):
+                raise AgentUnavailable("LLM credentials are missing or invalid.")
+            if resp.status_code >= 400:
+                raise AgentUnavailable(f"LLM request failed ({resp.status_code}).")
 
-            candidate = resp.candidates[0] if resp.candidates else None
-            if candidate is None or candidate.content is None or not candidate.content.parts:
+            choices = resp.json().get("choices") or []
+            message = choices[0].get("message") if choices else None
+            if not message or not (message.get("content") or message.get("tool_calls")):
                 # Blocked by a safety filter, or an empty completion.
                 return AgentReply("I can't help with that request.", tool_calls, self._model, refused=True)
 
-            calls = resp.function_calls or []
+            calls = message.get("tool_calls") or []
             if not calls:
-                text = "".join(p.text for p in candidate.content.parts if p.text and not p.thought).strip()
-                return AgentReply(text or "(No answer produced.)", tool_calls, self._model)
+                return AgentReply(message["content"].strip(), tool_calls, self._model)
 
             # Echo the model turn back unchanged (it carries thought signatures).
-            contents.append(candidate.content)
-            results = []
+            convo.append(message)
             for call in calls:
-                args = dict(call.args or {})
-                tool_calls.append({"name": call.name, "input": args})
-                result = await self._session.call_tool(call.name, args)
-                text = "\n".join(c.text for c in result.content if getattr(c, "text", None))
-                payload = {"error": text} if result.is_error else {"result": text}
-                results.append(
-                    types.Part(function_response=types.FunctionResponse(id=call.id, name=call.name, response=payload))
-                )
-            contents.append(types.Content(role="user", parts=results))
+                name = call["function"]["name"]
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                    result = await self._session.call_tool(name, args)
+                    text = "\n".join(c.text for c in result.content if getattr(c, "text", None))
+                    if result.is_error:
+                        text = f"ERROR: {text}"
+                except json.JSONDecodeError:
+                    args, text = {}, "ERROR: tool arguments were not valid JSON."
+                tool_calls.append({"name": name, "input": args})
+                convo.append({"role": "tool", "tool_call_id": call["id"], "content": text})
 
         return AgentReply(
             "I ran out of tool steps before finishing; try a narrower question.", tool_calls, self._model
@@ -249,6 +248,4 @@ async def _repl() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(_repl())

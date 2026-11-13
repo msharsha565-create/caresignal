@@ -279,7 +279,7 @@ function Chat({ selected }: { selected: string | null }) {
             {t.tools && t.tools.length > 0 && (
               <div className="tools">Used: {[...new Set(t.tools.map((c) => c.name))].join(", ")}</div>
             )}
-            {t.content}
+            {t.role === "assistant" ? <Markdown text={t.content} /> : t.content}
           </div>
         ))}
         {busy && <div className="msg assistant muted">Looking through the records…</div>}
@@ -304,5 +304,33 @@ function Chat({ selected }: { selected: string | null }) {
         </button>
       </form>
     </section>
+  );
+}
+
+/** Minimal, dependency-free rendering of the markdown the model tends to
+ *  produce: headings, bullets and bold/italic. Built from React nodes, so model
+ *  output is never injected as HTML. */
+function Markdown({ text }: { text: string }) {
+  const inline = (line: string) =>
+    line.split(/(\*\*[^*]+\*\*|\*[^*\s][^*]*\*)/g).map((part, i) =>
+      part.startsWith("**") && part.endsWith("**") && part.length > 4 ? (
+        <b key={i}>{part.slice(2, -2)}</b>
+      ) : part.startsWith("*") && part.endsWith("*") && part.length > 2 ? (
+        <i key={i}>{part.slice(1, -1)}</i>
+      ) : (
+        part
+      ),
+    );
+  return (
+    <>
+      {text.split("\n").map((line, i) => {
+        const heading = line.match(/^#{1,6}\s+(.*)$/);
+        const bullet = line.match(/^\s*(?:[*-]|\d+\.)\s+(.*)$/);
+        if (heading) return <div key={i} className="md-h">{inline(heading[1])}</div>;
+        if (bullet) return <div key={i} className="md-li">{inline(bullet[1])}</div>;
+        if (!line.trim()) return <div key={i} className="md-gap" />;
+        return <div key={i}>{inline(line)}</div>;
+      })}
+    </>
   );
 }

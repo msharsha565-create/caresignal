@@ -135,34 +135,31 @@ async def test_agent_loop_with_stubbed_llm(svc):
 
 @pytest.mark.anyio
 async def test_gemini_agent_loop_with_stubbed_llm(svc):
-    """Gemini provider: real MCP server, stubbed Gemini client."""
-    from types import SimpleNamespace
+    """Gemini provider: real MCP server, stubbed Gemini HTTP endpoint."""
+    import httpx
 
-    from google.genai import types
-
-    from caresignal.agent import CareSignalAgent
+    from caresignal.agent import GEMINI_BASE_URL, CareSignalAgent
 
     pid = svc.list_patients(limit=1)[0]["patient_id"]
     seen: list[dict] = []
 
-    def response(part):
-        return types.GenerateContentResponse(
-            candidates=[types.Candidate(content=types.Content(role="model", parts=[part]))]
-        )
-
-    async def generate_content(*, model, contents, config):
-        seen.append({"model": model, "contents": list(contents), "config": config})
+    def handler(request):
+        seen.append(json.loads(request.content))
         if len(seen) == 1:
-            return response(types.Part(function_call=types.FunctionCall(
-                id="c1", name="check_patient_medications", args={"patient_id": pid})))
-        return response(types.Part(text="No major interactions."))
+            message = {"role": "assistant", "tool_calls": [{
+                "id": "c1", "type": "function", "extra_content": {"google": {"thought_signature": "sig"}},
+                "function": {"name": "check_patient_medications", "arguments": json.dumps({"patient_id": pid})}}]}
+        else:
+            message = {"role": "assistant", "content": "No major interactions."}
+        return httpx.Response(200, json={"choices": [{"message": message}]})
 
-    stub = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
-    async with CareSignalAgent(stub, provider="gemini") as agent:
-        reply = await agent.chat([{"role": "user", "content": f"Meds for {pid}?"}])
+    async with httpx.AsyncClient(base_url=GEMINI_BASE_URL, transport=httpx.MockTransport(handler)) as stub:
+        async with CareSignalAgent(stub, provider="gemini") as agent:
+            reply = await agent.chat([{"role": "user", "content": f"Meds for {pid}?"}])
 
     assert reply.text == "No major interactions."
     assert reply.tool_calls == [{"name": "check_patient_medications", "input": {"patient_id": pid}}]
-    assert len(seen[0]["config"].tools[0].function_declarations) == 6
-    fr = seen[1]["contents"][-1].parts[0].function_response
-    assert fr.name == "check_patient_medications" and fr.id == "c1" and pid in fr.response["result"]
+    assert len(seen[0]["tools"]) == 6 and seen[0]["messages"][0]["role"] == "system"
+    echoed, result = seen[1]["messages"][-2:]
+    assert echoed["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "sig"
+    assert result == {"role": "tool", "tool_call_id": "c1", "content": result["content"]} and pid in result["content"]

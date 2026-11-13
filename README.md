@@ -66,8 +66,10 @@ export CARESIGNAL_PROVIDER=gemini GEMINI_API_KEY=...
 uvicorn caresignal.api:app --port 8000
 ```
 
-Free-tier Gemini is rate limited, and Google's free-tier terms allow prompts to be used to
-improve their products, so keep it to synthetic data.
+The Gemini path uses Google's OpenAI-compatible endpoint and defaults to
+`gemini-3.5-flash-lite` (override with `CARESIGNAL_GEMINI_MODEL`). Free-tier Gemini is rate
+limited and its larger models are sometimes unavailable under load. Check Google's
+free-tier data terms before sending anything other than synthetic data.
 
 Open http://localhost:8000. Without an API key the patient list, risk drivers and
 medication checks all work; the chat panel reports that the LLM is not configured.
