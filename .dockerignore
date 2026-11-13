@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+**/cdk.out
+**/__pycache__
+.git
+.env
+infra
+artifacts
+tests
