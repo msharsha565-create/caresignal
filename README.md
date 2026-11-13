@@ -31,7 +31,7 @@ interactions, and answers questions about the cohort in plain language.
 | REST API | FastAPI | `caresignal/api.py` |
 | Web app | TypeScript, React, Vite | `web/` |
 | Independent model validation | R (base only) | `r/analysis.R` |
-| Deployment | AWS CDK (TypeScript): Fargate + ALB + Bedrock | `infra/`, `Dockerfile` |
+| Deployment | Google Cloud Run + Gemini (`deploy/gcp/`), or AWS CDK (TypeScript): Fargate + ALB + Bedrock (`infra/`) | `Dockerfile` |
 
 The agent holds no clinical logic of its own: every fact it states comes from an MCP tool
 call. The same server therefore works unchanged in Claude Desktop or Claude Code:
@@ -103,6 +103,22 @@ of the default cohort (6,000 patients, 18% readmitted):
 
 "Drivers" are occlusion attributions: how many points the predicted risk moves when one
 feature is replaced by the cohort average.
+
+## Deploy to Google Cloud (Cloud Run + Gemini)
+
+```bash
+PROJECT_ID=your-project-id ./deploy/gcp/deploy.sh
+```
+
+Run it from the repository root in Cloud Shell (or anywhere `gcloud` is logged in). It
+builds the Dockerfile with Cloud Build and deploys one Cloud Run service that serves the
+UI, API, agent and MCP server. The script asks for your Gemini API key once and stores it
+in Secret Manager; the service reads it from there with a dedicated service account.
+
+The app has no login of its own, so the service is **private by default**. View it with
+`gcloud run services proxy caresignal --region us-central1 --port 8080`, or pass
+`PUBLIC=1` to the script to open the URL to anyone. Scales to zero when idle; the first
+request after idle takes several seconds while the model loads.
 
 ## Deploy to AWS
 

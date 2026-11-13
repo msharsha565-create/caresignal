@@ -19,4 +19,5 @@ COPY --from=web /web/dist web/dist
 RUN useradd -m app && chown -R app /app
 USER app
 EXPOSE 8000
-CMD ["uvicorn", "caresignal.api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Cloud Run supplies PORT; default to 8000 elsewhere (ECS, local).
+CMD ["sh", "-c", "exec uvicorn caresignal.api:app --host 0.0.0.0 --port ${PORT:-8000}"]
