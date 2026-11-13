@@ -163,3 +163,19 @@ async def test_gemini_agent_loop_with_stubbed_llm(svc):
     echoed, result = seen[1]["messages"][-2:]
     assert echoed["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "sig"
     assert result == {"role": "tool", "tool_call_id": "c1", "content": result["content"]} and pid in result["content"]
+
+
+@pytest.mark.anyio
+async def test_gemini_bad_key_is_reported_as_credentials(svc):
+    """Google answers an invalid key with HTTP 400; the user should be told it's the key."""
+    import httpx
+
+    from caresignal.agent import GEMINI_BASE_URL, AgentUnavailable, CareSignalAgent
+
+    def handler(request):
+        return httpx.Response(400, json=[{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}])
+
+    async with httpx.AsyncClient(base_url=GEMINI_BASE_URL, transport=httpx.MockTransport(handler)) as stub:
+        async with CareSignalAgent(stub, provider="gemini") as agent:
+            with pytest.raises(AgentUnavailable, match="credentials"):
+                await agent.chat([{"role": "user", "content": "hi"}])

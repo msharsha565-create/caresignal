@@ -120,6 +120,9 @@ The app has no login of its own, so the service is **private by default**. View 
 `PUBLIC=1` to the script to open the URL to anyone. Scales to zero when idle; the first
 request after idle takes several seconds while the model loads.
 
+If the chat reports invalid credentials after deploying, replace the stored key with
+`./deploy/gcp/set-key.sh`; it tests the key against Gemini before saving it.
+
 ## Deploy to AWS
 
 ```bash

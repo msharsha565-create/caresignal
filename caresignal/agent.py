@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from contextlib import AsyncExitStack
@@ -45,6 +46,20 @@ never replaces, clinical judgment. Flag medication interactions for pharmacist o
 review rather than telling anyone to start, stop or change a drug.
 - The cohort is synthetic demonstration data. Say so if the user appears to treat it as real.
 - Be concise: lead with the answer, then the supporting numbers."""
+
+
+log = logging.getLogger("caresignal.agent")
+
+
+def _gemini_error(resp: httpx.Response) -> str:
+    """Pull the human-readable message out of a Gemini error body."""
+    try:
+        body = resp.json()
+        if isinstance(body, list):
+            body = body[0]
+        return str(body["error"]["message"])
+    except Exception:
+        return resp.text[:200] or "no details"
 
 
 class AgentUnavailable(RuntimeError):
@@ -163,7 +178,8 @@ class CareSignalAgent:
         """Same agent on Google Gemini (OpenAI-compatible endpoint): a manual
         tool loop over the MCP session."""
         if self._client is None:
-            key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            # Strip stray whitespace/newlines that creep in when a key is pasted.
+            key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
             if not key:
                 raise AgentUnavailable("LLM credentials are not configured (set GEMINI_API_KEY).")
             self._client = await self._stack.enter_async_context(
@@ -193,10 +209,13 @@ class CareSignalAgent:
                 raise AgentUnavailable("The LLM service is overloaded right now; try again in a minute.")
             if resp.status_code == 429:
                 raise AgentUnavailable("The LLM is rate limited (free-tier quota); try again shortly.")
-            if resp.status_code in (401, 403):
-                raise AgentUnavailable("LLM credentials are missing or invalid.")
             if resp.status_code >= 400:
-                raise AgentUnavailable(f"LLM request failed ({resp.status_code}).")
+                reason = _gemini_error(resp)
+                log.warning("Gemini request failed: %s %s", resp.status_code, reason)
+                # Google reports a bad key as 400 "API key not valid", not 401.
+                if resp.status_code in (401, 403) or "api key" in reason.lower():
+                    raise AgentUnavailable("LLM credentials are missing or invalid (check GEMINI_API_KEY).")
+                raise AgentUnavailable(f"LLM request failed ({resp.status_code}): {reason[:200]}")
 
             choices = resp.json().get("choices") or []
             message = choices[0].get("message") if choices else None

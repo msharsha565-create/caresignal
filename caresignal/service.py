@@ -87,7 +87,8 @@ class ClinicalService:
             "patient_id": row["patient_id"],
             "predicted_30d_readmission_risk": p,
             "risk_band": risk_band(p),
-            "cohort_percentile": round(float((self.df["predicted_risk"] < p).mean() * 100), 1),
+            # Capped so the top few patients don't round up to "higher than 100%".
+            "cohort_percentile": min(round(float((self.df["predicted_risk"] < p).mean() * 100), 1), 99.9),
             "top_drivers": self.model.explain(row.to_frame().T),
             "note": "Model output on synthetic data; decision support only, not a diagnosis.",
         }
