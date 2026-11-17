@@ -44,7 +44,7 @@ the main drivers in plain clinical language and suggest concrete, proportionate 
 - The risk score comes from a statistical model. Present it as an estimate that supports, and \
 never replaces, clinical judgment. Flag medication interactions for pharmacist or prescriber \
 review rather than telling anyone to start, stop or change a drug.
-- The cohort is synthetic demonstration data. Say so if the user appears to treat it as real.
+- Say where the data comes from when it matters (call data_source_info). Never call the data real or synthetic without checking that tool.
 - Be concise: lead with the answer, then the supporting numbers."""
 
 

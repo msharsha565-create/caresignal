@@ -1,7 +1,14 @@
-"""PyTorch 30-day readmission risk model: features, training, inference."""
+"""PyTorch 30-day readmission risk model: features, training, inference.
+
+One network, several cohorts. The synthetic demo records different things from the
+real-data cohorts (UCI research data and a live FHIR feed), so every model artifact
+stores the feature list it was trained on.
+"""
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,8 +19,10 @@ from torch import nn
 
 from .data import generate_cohort
 
-ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "artifacts"
+ROOT = Path(__file__).resolve().parent.parent
+ARTIFACT_DIR = Path(os.environ.get("CARESIGNAL_ARTIFACTS", ROOT / "artifacts"))
 
+# Synthetic demo cohort (see data.py).
 NUMERIC = [
     "age", "length_of_stay", "prior_admissions_12m", "num_medications",
     "charlson_index", "hba1c", "creatinine", "systolic_bp", "bmi",
@@ -21,11 +30,20 @@ NUMERIC = [
 BINARY = ["chf", "copd", "diabetes", "ckd", "lives_alone"]
 FEATURES = NUMERIC + BINARY + ["sex_male", "discharged_snf", "discharged_home_health"]
 
+# What the real-data cohorts (uci.py, fhir.py) can measure.
+REAL_FEATURES = [
+    "age", "length_of_stay", "prior_admissions_12m", "num_medications", "num_diagnoses",
+    "hba1c", "chf", "copd", "diabetes", "ckd", "sex_male", "discharged_snf", "discharged_home_health",
+]
+# Display columns the real-data cohorts do not record. Kept (empty) so the API shape is stable.
+NOT_RECORDED = ["creatinine", "systolic_bp", "bmi", "lives_alone", "charlson_index"]
+
 FEATURE_LABELS = {
     "age": "Age",
     "length_of_stay": "Length of stay",
     "prior_admissions_12m": "Admissions in prior 12 months",
     "num_medications": "Number of medications",
+    "num_diagnoses": "Number of diagnoses",
     "charlson_index": "Charlson comorbidity index",
     "hba1c": "HbA1c",
     "creatinine": "Creatinine",
@@ -42,15 +60,33 @@ FEATURE_LABELS = {
 }
 
 
-def build_features(df: pd.DataFrame, medians: dict[str, float]) -> pd.DataFrame:
-    """Turn raw cohort rows into the model's feature frame (imputing labs)."""
-    out = df[NUMERIC + BINARY].copy()
-    for col, med in medians.items():
-        out[col] = out[col].fillna(med)
-    out["sex_male"] = (df["sex"] == "M").astype(int)
-    out["discharged_snf"] = (df["discharge_disposition"] == "snf").astype(int)
-    out["discharged_home_health"] = (df["discharge_disposition"] == "home_health").astype(int)
-    return out[FEATURES].astype("float32")
+def prepare(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the derived columns every cohort shares."""
+    x = df.copy()
+    x["sex_male"] = (x["sex"] == "M").astype(int)
+    x["discharged_snf"] = (x["discharge_disposition"] == "snf").astype(int)
+    x["discharged_home_health"] = (x["discharge_disposition"] == "home_health").astype(int)
+    return x
+
+
+def complete_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill in display columns this data source does not record."""
+    x = df.copy()
+    for col in NOT_RECORDED:
+        if col not in x:
+            x[col] = np.nan
+    return x
+
+
+def compute_medians(df: pd.DataFrame, features: list[str]) -> dict[str, float]:
+    x = prepare(df)
+    return {f: float(x[f].median()) for f in features}
+
+
+def build_features(df: pd.DataFrame, medians: dict[str, float], features: list[str]) -> pd.DataFrame:
+    """Derive, impute with training medians, and select the model's inputs."""
+    x = prepare(df).fillna(value=medians)
+    return x[list(features)].astype("float32")
 
 
 class RiskNet(nn.Module):
@@ -79,12 +115,13 @@ class RiskModel:
     """Trained network plus the preprocessing needed to score raw rows."""
 
     net: RiskNet
+    features: list[str]
     medians: dict[str, float]
     mean: np.ndarray
     std: np.ndarray
 
     def _x(self, df: pd.DataFrame) -> torch.Tensor:
-        feats = build_features(df, self.medians).to_numpy()
+        feats = build_features(df, self.medians, self.features).to_numpy()
         return torch.from_numpy((feats - self.mean) / self.std)
 
     @torch.no_grad()
@@ -95,20 +132,20 @@ class RiskModel:
     @torch.no_grad()
     def explain(self, row: pd.DataFrame, top_k: int = 5) -> list[dict]:
         """Occlusion attribution: how much does risk move when one feature is
-        replaced by the cohort average? Positive = feature raises this
-        patient's risk."""
+        replaced by the cohort average? Positive = feature raises this patient's risk."""
         self.net.eval()
         x = self._x(row)
         base = torch.sigmoid(self.net(x)).item()
-        occluded = x.repeat(len(FEATURES), 1)
-        occluded[torch.arange(len(FEATURES)), torch.arange(len(FEATURES))] = 0.0
+        n = len(self.features)
+        occluded = x.repeat(n, 1)
+        occluded[torch.arange(n), torch.arange(n)] = 0.0
         delta = base - torch.sigmoid(self.net(occluded)).numpy()
-        raw = build_features(row, self.medians).iloc[0]
+        raw = build_features(row, self.medians, self.features).iloc[0]
         order = np.argsort(-np.abs(delta))[:top_k]
         return [
             {
-                "feature": FEATURES[i],
-                "label": FEATURE_LABELS[FEATURES[i]],
+                "feature": self.features[i],
+                "label": FEATURE_LABELS.get(self.features[i], self.features[i]),
                 "value": round(float(raw.iloc[i]), 2),
                 "risk_contribution": round(float(delta[i]), 4),
             }
@@ -119,10 +156,10 @@ class RiskModel:
         torch.save(
             {
                 "state_dict": self.net.state_dict(),
+                "features": self.features,
                 "medians": self.medians,
                 "mean": self.mean.tolist(),
                 "std": self.std.tolist(),
-                "features": FEATURES,
             },
             path,
         )
@@ -130,35 +167,42 @@ class RiskModel:
     @classmethod
     def load(cls, path: Path) -> "RiskModel":
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        if ckpt["features"] != FEATURES:
-            raise ValueError("Model artifact was trained with a different feature set; retrain.")
-        net = RiskNet(len(FEATURES))
+        features = list(ckpt.get("features", FEATURES))
+        net = RiskNet(len(features))
         net.load_state_dict(ckpt["state_dict"])
         return cls(
             net,
+            features,
             ckpt["medians"],
             np.array(ckpt["mean"], dtype="float32"),
             np.array(ckpt["std"], dtype="float32"),
         )
 
 
-def train(n: int = 6000, epochs: int = 60, seed: int = 7, out_dir: Path = ARTIFACT_DIR) -> dict:
-    """Generate the cohort, train, and write cohort.csv / model.pt /
-    predictions.csv / metrics.json to `out_dir`."""
+def train_frame(
+    df: pd.DataFrame,
+    split: np.ndarray,
+    features: list[str],
+    out_dir: Path,
+    *,
+    epochs: int = 60,
+    seed: int = 7,
+    metadata: dict | None = None,
+) -> dict:
+    """Train on the 'train' rows, early-stop on 'val' AUROC, report 'test' metrics,
+    and write cohort.csv, model.pt, predictions.csv and metrics.json to `out_dir`."""
     torch.manual_seed(seed)
-    df = generate_cohort(n, seed)
-    rng = np.random.default_rng(seed)
-    split = rng.choice(["train", "val", "test"], n, p=[0.7, 0.15, 0.15])
-    tr = df[split == "train"]
+    df = df.reset_index(drop=True)
+    split = np.asarray(split)
+    tr, val, test = df[split == "train"], df[split == "val"], df[split == "test"]
 
-    medians = {c: float(tr[c].median()) for c in ("hba1c", "creatinine")}
-    f_tr = build_features(tr, medians).to_numpy()
+    medians = compute_medians(tr, features)
+    f_tr = build_features(tr, medians, features).to_numpy()
     mean, std = f_tr.mean(0), f_tr.std(0) + 1e-6
-    model = RiskModel(RiskNet(len(FEATURES)), medians, mean, std)
+    model = RiskModel(RiskNet(len(features)), list(features), medians, mean, std)
 
     x_tr = model._x(tr)
     y_tr = torch.tensor(tr["readmitted_30d"].to_numpy(), dtype=torch.float32)
-    val = df[split == "val"]
     y_val = val["readmitted_30d"].to_numpy()
 
     opt = torch.optim.AdamW(model.net.parameters(), lr=3e-3, weight_decay=1e-3)
@@ -178,18 +222,18 @@ def train(n: int = 6000, epochs: int = 60, seed: int = 7, out_dir: Path = ARTIFA
             best_state = {k: v.clone() for k, v in model.net.state_dict().items()}
     model.net.load_state_dict(best_state)
 
-    test = df[split == "test"]
     p_test = model.predict(test)
     y_test = test["readmitted_30d"].to_numpy()
     metrics = {
-        "n_patients": n,
+        **(metadata or {}),
+        "features": list(features),
         "n_test": int(len(test)),
-        "readmission_rate": round(float(df["readmitted_30d"].mean()), 4),
         "val_auroc": round(best_auc, 4),
         "test_auroc": round(auroc(y_test, p_test), 4),
         "test_brier": round(float(np.mean((p_test - y_test) ** 2)), 4),
     }
 
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "cohort.csv", index=False)
     model.save(out_dir / "model.pt")
@@ -200,5 +244,34 @@ def train(n: int = 6000, epochs: int = 60, seed: int = 7, out_dir: Path = ARTIFA
     return metrics
 
 
+def train(n: int = 6000, epochs: int = 60, seed: int = 7, out_dir: Path = ARTIFACT_DIR) -> dict:
+    """Synthetic demo cohort (see data.py)."""
+    df = generate_cohort(n, seed)
+    rng = np.random.default_rng(seed)
+    split = rng.choice(["train", "val", "test"], n, p=[0.7, 0.15, 0.15])
+    return train_frame(
+        df, split, FEATURES, out_dir, epochs=epochs, seed=seed,
+        metadata={
+            "dataset": "synthetic",
+            "data_label": "Synthetic demo data",
+            "n_patients": n,
+            "readmission_rate": round(float(df["readmitted_30d"].mean()), 4),
+        },
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Train the CareSignal readmission model.")
+    ap.add_argument("--dataset", choices=["synthetic", "uci"], default="synthetic")
+    args = ap.parse_args(argv)
+    if args.dataset == "uci":
+        from .uci import build_uci_artifacts
+
+        metrics = build_uci_artifacts()
+    else:
+        metrics = train()
+    print(json.dumps(metrics, indent=2))
+
+
 if __name__ == "__main__":
-    print(json.dumps(train(), indent=2))
+    main()

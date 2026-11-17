@@ -12,10 +12,18 @@ from .service import get_service
 mcp = MCPServer(
     "caresignal",
     instructions=(
-        "Tools over a SYNTHETIC inpatient discharge cohort: patient lookup, a PyTorch "
+        "Tools over an inpatient discharge cohort (synthetic demo, de-identified research data, "
+        "or a live hospital feed; call data_source_info to see which): patient lookup, a PyTorch "
         "30-day readmission risk model, medication interaction checks and cohort statistics."
     ),
 )
+
+
+@mcp.tool()
+def data_source_info() -> dict:
+    """Where the data comes from (synthetic demo, de-identified research data, or a live
+    hospital FHIR feed), how many records there are, and the model's held-out accuracy."""
+    return get_service().info()
 
 
 @mcp.tool()

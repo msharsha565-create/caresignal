@@ -1,36 +1,69 @@
-"""FastAPI backend: REST endpoints for the UI plus the agent chat endpoint."""
+"""FastAPI backend: REST endpoints for the UI plus the agent chat endpoint.
+
+Every request for a patient record or an agent question is written to the audit log
+(one JSON line per event, to stdout, so Cloud Run / Cloud Logging keeps it). Question
+text is not logged, since it can contain identifiers.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .agent import AgentUnavailable, CareSignalAgent
-from .model import ARTIFACT_DIR
 from .service import NotFound, get_service
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+audit = logging.getLogger("caresignal.audit")
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_service()  # fail fast if artifacts are missing
+    source = os.environ.get("CARESIGNAL_SOURCE", "synthetic").lower()
+    provider = os.environ.get("CARESIGNAL_PROVIDER", "anthropic").lower()
+    if source == "fhir" and provider == "gemini" and os.environ.get("CARESIGNAL_ALLOW_FREE_TIER_LLM") != "1":
+        raise RuntimeError(
+            "Refusing to send live, identifiable patient data to the Gemini free tier. Use "
+            "CARESIGNAL_PROVIDER=bedrock, or an Anthropic key under a BAA. Set "
+            "CARESIGNAL_ALLOW_FREE_TIER_LLM=1 only for non-identifiable test data."
+        )
+    get_service()  # static sources load now; live sources load on the first request
     async with CareSignalAgent() as agent:
         app.state.agent = agent
         yield
 
 
-app = FastAPI(title="CareSignal", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="CareSignal", version="1.1.0", lifespan=lifespan)
 
 if origins := os.environ.get("CARESIGNAL_CORS_ORIGINS"):  # e.g. http://localhost:5173 in dev
     app.add_middleware(CORSMiddleware, allow_origins=origins.split(","), allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def audit_access(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/api/patients/") or path == "/api/chat":
+        audit.info(json.dumps({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "event": "patient_record_view" if path.startswith("/api/patients/") else "agent_query",
+            "path": path,
+            "status": response.status_code,
+            "user": request.headers.get("x-goog-authenticated-user-email")
+            or request.headers.get("x-forwarded-user"),
+            "client": request.client.host if request.client else None,
+        }))
+    return response
 
 
 class ChatMessage(BaseModel):
@@ -49,7 +82,7 @@ def health() -> dict:
 
 @app.get("/api/metrics")
 def metrics() -> dict:
-    return json.loads((ARTIFACT_DIR / "metrics.json").read_text())
+    return get_service().info()
 
 
 @app.get("/api/patients")
@@ -80,7 +113,10 @@ def cohort(
     group_by: Literal["risk_band", "discharge_disposition", "sex", "chf", "copd", "diabetes", "ckd", "lives_alone"]
     | None = None,
 ) -> dict:
-    return get_service().cohort_summary(group_by)
+    try:
+        return get_service().cohort_summary(group_by)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
 
 
 @app.post("/api/chat")

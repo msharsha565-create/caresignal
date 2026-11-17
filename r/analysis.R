@@ -1,28 +1,42 @@
 #!/usr/bin/env Rscript
-# Independent statistical validation of the PyTorch risk model (base R only).
-#   Rscript r/analysis.R            -> writes artifacts/r_validation.md
-# 1. Logistic-regression baseline with odds ratios and 95% CIs.
-# 2. Held-out discrimination: neural net vs. the GLM baseline (AUROC).
+# Independent check of the PyTorch readmission model, base R only.
+#
+#   Rscript r/analysis.R [artifact_dir]     # default: artifacts  (real data: artifacts/uci)
+#
+# 1. Logistic regression on the same training split, features and median imputation.
+# 2. Held-out AUROC: neural net vs. logistic regression.
 # 3. Calibration of the neural net by predicted-risk decile.
+# Writes <artifact_dir>/r_validation.md
 
-art <- "artifacts"
+args <- commandArgs(trailingOnly = TRUE)
+art <- if (length(args) >= 1) args[1] else "artifacts"
+
 cohort <- read.csv(file.path(art, "cohort.csv"), stringsAsFactors = FALSE)
 preds  <- read.csv(file.path(art, "predictions.csv"), stringsAsFactors = FALSE)
-df <- merge(cohort, preds, by = "patient_id")
+df <- merge(cohort, preds[, c("patient_id", "split", "predicted_risk")], by = "patient_id")
 
-# Same imputation rule as the Python pipeline: training-set medians.
-train <- df$split == "train"
-for (lab in c("hba1c", "creatinine")) {
-  df[[lab]][is.na(df[[lab]])] <- median(df[[lab]][train], na.rm = TRUE)
+df$sex_male <- as.integer(df$sex == "M")
+df$discharged_snf <- as.integer(df$discharge_disposition == "snf")
+df$discharged_home_health <- as.integer(df$discharge_disposition == "home_health")
+
+candidates <- c("age", "length_of_stay", "prior_admissions_12m", "num_medications",
+                "num_diagnoses", "charlson_index", "hba1c", "creatinine", "systolic_bp",
+                "bmi", "chf", "copd", "diabetes", "ckd", "lives_alone",
+                "sex_male", "discharged_snf", "discharged_home_health")
+informative <- function(f) {
+  v <- df[[f]]
+  sum(!is.na(v)) > 0 && length(unique(v[!is.na(v)])) > 1
 }
-df$discharge_disposition <- relevel(factor(df$discharge_disposition), ref = "home")
+features <- Filter(informative, intersect(candidates, names(df)))
 
-fit <- glm(
-  readmitted_30d ~ age + sex + length_of_stay + prior_admissions_12m +
-    num_medications + charlson_index + hba1c + creatinine + systolic_bp + bmi +
-    chf + copd + diabetes + ckd + lives_alone + discharge_disposition,
-  data = df[train, ], family = binomial()
-)
+train <- df$split == "train"
+for (f in features) {
+  med <- median(df[[f]][train], na.rm = TRUE)   # same training-set imputation as the Python model
+  df[[f]][is.na(df[[f]])] <- med
+}
+
+fit <- glm(as.formula(paste("readmitted_30d ~", paste(features, collapse = " + "))),
+           data = df[train, ], family = binomial())
 
 co <- summary(fit)$coefficients
 or <- data.frame(
@@ -43,10 +57,11 @@ test <- df[df$split == "test", ]
 auc_nn  <- auroc(test$readmitted_30d, test$predicted_risk)
 auc_glm <- auroc(test$readmitted_30d, predict(fit, test, type = "response"))
 
-test$decile <- cut(test$predicted_risk,
-                   quantile(test$predicted_risk, 0:10 / 10), include.lowest = TRUE, labels = 1:10)
-calib <- aggregate(cbind(predicted = predicted_risk, observed = readmitted_30d) ~ decile, test, mean)
-calib$n <- as.vector(table(test$decile))
+brk <- unique(quantile(test$predicted_risk, probs = seq(0, 1, 0.1)))
+test$decile <- cut(test$predicted_risk, brk, include.lowest = TRUE, labels = FALSE)
+calib <- aggregate(cbind(predicted = predicted_risk, observed = readmitted_30d) ~ decile,
+                   data = test, FUN = mean)
+calib$n <- format(as.vector(table(test$decile)), big.mark = ",")
 
 md_table <- function(d, digits = 3) {
   d[] <- lapply(d, function(x) if (is.numeric(x)) formatC(x, digits = digits, format = "g") else as.character(x))
@@ -57,7 +72,8 @@ md_table <- function(d, digits = 3) {
 
 out <- c(
   "# CareSignal model validation (R)", "",
-  sprintf("Synthetic cohort: %d patients, %d held-out test patients.", nrow(df), nrow(test)), "",
+  sprintf("Data directory: `%s`. Records: %d; held-out test records: %d.", art, nrow(df), nrow(test)), "",
+  sprintf("Features used (%d): %s", length(features), paste(features, collapse = ", ")), "",
   "## Held-out discrimination (AUROC)", "",
   sprintf("- PyTorch neural net: **%.3f**", auc_nn),
   sprintf("- Logistic regression baseline: **%.3f**", auc_glm), "",

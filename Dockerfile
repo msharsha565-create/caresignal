@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
  && pip install --no-cache-dir -r requirements.txt
 COPY caresignal/ caresignal/
 # Deterministic (seeded): generates the synthetic cohort and trains the model.
-RUN python -m caresignal.model
+RUN python -m caresignal.model \
+ && python -m caresignal.model --dataset uci
 COPY --from=web /web/dist web/dist
 RUN useradd -m app && chown -R app /app
 USER app

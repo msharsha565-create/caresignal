@@ -66,7 +66,7 @@ async def test_mcp_server_over_stdio(svc):
             await session.initialize()
             names = {t.name for t in (await session.list_tools()).tools}
             assert names == {
-                "get_patient", "list_patients", "predict_readmission_risk",
+                "data_source_info", "get_patient", "list_patients", "predict_readmission_risk",
                 "check_patient_medications", "check_drug_interactions", "cohort_summary",
             }
             result = await session.call_tool("predict_readmission_risk", {"patient_id": pid})
@@ -86,7 +86,7 @@ def test_rest_api(svc):
     from caresignal.api import app
 
     with TestClient(app) as client:
-        assert len(client.get("/api/health").json()["tools"]) == 6
+        assert len(client.get("/api/health").json()["tools"]) == 7
         rows = client.get("/api/patients", params={"risk_band": "high", "limit": 5}).json()
         assert len(rows) == 5 and rows[0]["predicted_risk"] >= rows[-1]["predicted_risk"]
         detail = client.get(f"/api/patients/{rows[0]['patient_id']}").json()
@@ -128,7 +128,7 @@ async def test_agent_loop_with_stubbed_llm(svc):
 
     assert reply.text == "High risk."
     assert reply.tool_calls == [{"name": "predict_readmission_risk", "input": {"patient_id": pid}}]
-    assert len(seen[0]["tools"]) == 6 and seen[0]["model"] == "claude-opus-5-5"
+    assert len(seen[0]["tools"]) == 7 and seen[0]["model"] == "claude-opus-5-5"
     tool_result = seen[1]["messages"][-1]["content"][0]
     assert tool_result["type"] == "tool_result" and pid in json.dumps(tool_result["content"])
 
@@ -159,7 +159,7 @@ async def test_gemini_agent_loop_with_stubbed_llm(svc):
 
     assert reply.text == "No major interactions."
     assert reply.tool_calls == [{"name": "check_patient_medications", "input": {"patient_id": pid}}]
-    assert len(seen[0]["tools"]) == 6 and seen[0]["messages"][0]["role"] == "system"
+    assert len(seen[0]["tools"]) == 7 and seen[0]["messages"][0]["role"] == "system"
     echoed, result = seen[1]["messages"][-2:]
     assert echoed["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "sig"
     assert result == {"role": "tool", "tool_call_id": "c1", "content": result["content"]} and pid in result["content"]

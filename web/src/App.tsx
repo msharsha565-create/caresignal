@@ -60,11 +60,14 @@ export default function App() {
     <div className="app">
       <header>
         <h1>CareSignal</h1>
-        <span className="tag">Synthetic demo data · decision support only</span>
+        <span className="tag">{metrics ? metrics.data_label : "Loading data source…"} · decision support only</span>
         {metrics && (
           <span className="stats">
-            {metrics.n_patients.toLocaleString()} discharges · {pct(metrics.readmission_rate)} readmitted in 30 days ·
-            model AUROC {metrics.test_auroc.toFixed(2)}
+            {metrics.n_patients.toLocaleString()} discharges ·{" "}
+            {metrics.observed_readmission_rate == null
+              ? "readmissions not yet known"
+              : `${pct(metrics.observed_readmission_rate)} readmitted in 30 days`}
+            {metrics.test_auroc != null && ` · model AUROC ${metrics.test_auroc.toFixed(2)} on held-out data`}
           </span>
         )}
       </header>
@@ -192,14 +195,15 @@ function Detail({ d }: { d: PatientDetail }) {
         <dd>{conditions.length ? conditions.join(", ") : "None recorded"}</dd>
         <dt>Stay</dt>
         <dd>
-          {p.length_of_stay} days · {p.prior_admissions_12m} admissions in prior 12 months
+          {p.length_of_stay} {p.length_of_stay === 1 ? "day" : "days"} · {p.prior_admissions_12m} admissions in prior 12 months
         </dd>
         <dt>Labs</dt>
         <dd>
-          HbA1c {p.hba1c ?? "not drawn"} · creatinine {p.creatinine ?? "not drawn"} · SBP {p.systolic_bp}
+          HbA1c {p.hba1c ?? "not recorded"} · creatinine {p.creatinine ?? "not recorded"} · SBP{" "}
+          {p.systolic_bp ?? "not recorded"}
         </dd>
         <dt>Home</dt>
-        <dd>{p.lives_alone ? "Lives alone" : "Lives with others"}</dd>
+        <dd>{p.lives_alone == null ? "not recorded" : p.lives_alone ? "Lives alone" : "Lives with others"}</dd>
         <dt>Medications ({p.medications.length})</dt>
         <dd>{p.medications.join(", ")}</dd>
       </dl>

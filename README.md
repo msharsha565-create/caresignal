@@ -90,7 +90,7 @@ pytest                            # model, service, MCP-over-stdio, REST API, ag
 
 For UI development run `npm --prefix web run dev` (proxies `/api` to port 8000).
 
-## The model
+## The model (synthetic demo)
 
 A small MLP trained on 17 features (age, prior admissions, length of stay, Charlson index,
 labs, comorbidities, living situation, discharge disposition). On the held-out test split
@@ -103,6 +103,57 @@ of the default cohort (6,000 patients, 18% readmitted):
 
 "Drivers" are occlusion attributions: how many points the predicted risk moves when one
 feature is replaced by the cohort average.
+
+## Real data
+
+CareSignal runs on three data sources, chosen with `CARESIGNAL_SOURCE`:
+
+| Source | What it is | Setup |
+| --- | --- | --- |
+| `synthetic` (default) | Generated demo cohort | none |
+| `uci` | **Real** de-identified inpatient encounters: 101,766 diabetes admissions from 130 US hospitals, 1999–2008 (UCI Machine Learning Repository, Strack et al. 2014) | `python -m caresignal.model --dataset uci` (downloads once, about 40 s to train) |
+| `fhir` | **Live** hospital record system over FHIR R4, refreshed every `CARESIGNAL_FHIR_TTL` seconds (default 900) | set `CARESIGNAL_FHIR_BASE` (and `CARESIGNAL_FHIR_TOKEN`) |
+
+Results on real data (held-out patients, 15,001 encounters, 11.4% readmitted within 30 days):
+
+- PyTorch model: **AUROC 0.65**, Brier 0.100. The R logistic regression on the same split scores 0.64
+  (`artifacts/uci/r_validation.md` after `Rscript r/analysis.R artifacts/uci`).
+- The synthetic demo scores 0.76 because it was generated from a known formula. Real readmission is harder
+  to predict, and 0.65 is the honest figure to quote.
+
+**How the real data maps onto the model** (`caresignal/uci.py`, `caresignal/fhir.py`):
+
+| Model input | UCI dataset | Live FHIR |
+| --- | --- | --- |
+| Age | decade bracket, midpoint used (25 means 20–29) | `Patient.birthDate` |
+| Length of stay | `time_in_hospital` (days) | Encounter period |
+| Prior admissions (12 months) | `number_inpatient` | finished inpatient encounters in the prior 365 days |
+| Medications / diagnoses | counts from the record | active `MedicationRequest` count / `Condition` count |
+| HbA1c | three categories (Norm, >7, >8) mapped to 5.5 / 7.5 / 9.0 | latest LOINC 4548-4 |
+| Heart failure, COPD, diabetes, CKD | ICD-9 codes | ICD-10 codes (I50, J43/J44, E08–E13, N18) |
+| Discharged to SNF / home health | discharge id 3 / 6 | UB-04 codes 03 / 06 |
+| 30-day readmission (label) | `readmitted` = `<30` | next admission within 30 days; unknown if none on record |
+
+Not recorded by either source (shown as "not recorded" in the app): creatinine, blood pressure, BMI,
+living situation, and Charlson index. Encounters ending in death or hospice are excluded. In the UCI
+data, patients are split whole into train, validation and test, so no patient appears in two splits.
+
+**Before any identifiable patient data goes in**, these are required and are not yet done:
+
+1. **Access control.** The app has no login. Cloud Run is private by default, so it sits behind Google
+   sign-in; identity-aware access (IAP, with per-user rules) is the next step.
+2. **A data agreement covering every vendor in the path.** The Gemini free tier is not covered for
+   identifiable data. The app refuses to start with `CARESIGNAL_SOURCE=fhir` and `CARESIGNAL_PROVIDER=gemini`
+   unless `CARESIGNAL_ALLOW_FREE_TIER_LLM=1` is set, which is only for non-identifiable test data. Use
+   Bedrock or an Anthropic key under a BAA. The cloud project needs a BAA too.
+3. **Audit logging** is in place: every patient-record view and agent question is written as one JSON
+   line to Cloud Logging (question text is not logged). Retention and review are still to be set up.
+4. **A licensed drug-interaction database.** `service.py` holds only illustrative pairs.
+5. **Clinical validation** on your own patients, including calibration by site and subgroup fairness,
+   and whatever regulatory review applies.
+
+Connecting a real hospital means its IT team issues a FHIR endpoint and a SMART access token. Store the
+token in Secret Manager (`FHIR_TOKEN_SECRET=<secret name>` on the deploy script), never in the repository.
 
 ## Deploy to Google Cloud (Cloud Run + Gemini)
 

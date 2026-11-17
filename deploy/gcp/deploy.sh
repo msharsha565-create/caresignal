@@ -35,6 +35,16 @@ gcloud secrets add-iam-policy-binding "$SECRET" \
 # The app has no login of its own, so the service is private unless PUBLIC=1.
 if [ "${PUBLIC:-0}" = "1" ]; then ACCESS="--allow-unauthenticated"; else ACCESS="--no-allow-unauthenticated"; fi
 
+# SOURCE: synthetic | uci (default, real de-identified encounters) | fhir (live hospital feed).
+ENV_VARS="CARESIGNAL_PROVIDER=gemini,CARESIGNAL_SOURCE=${SOURCE:-uci}"
+EXTRA=()
+if [ -n "${FHIR_BASE:-}" ]; then
+  ENV_VARS+=",CARESIGNAL_FHIR_BASE=${FHIR_BASE}"
+fi
+if [ -n "${FHIR_TOKEN_SECRET:-}" ]; then
+  EXTRA+=(--update-secrets "CARESIGNAL_FHIR_TOKEN=${FHIR_TOKEN_SECRET}:latest")
+fi
+
 # Builds the Dockerfile with Cloud Build, then deploys the image.
 gcloud run deploy "$SERVICE" \
   --source . \
@@ -42,8 +52,9 @@ gcloud run deploy "$SERVICE" \
   --service-account "$SA" \
   --memory 2Gi --cpu 1 --timeout 300 \
   --min-instances 0 --max-instances 2 \
-  --set-env-vars CARESIGNAL_PROVIDER=gemini \
+  --set-env-vars "$ENV_VARS" \
   --set-secrets "GEMINI_API_KEY=${SECRET}:latest" \
+  ${EXTRA[@]+"${EXTRA[@]}"} \
   $ACCESS
 
 echo

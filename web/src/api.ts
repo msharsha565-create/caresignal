@@ -30,13 +30,13 @@ export interface PatientDetail {
     num_medications: number;
     hba1c: number | null;
     creatinine: number | null;
-    systolic_bp: number;
-    bmi: number;
+    systolic_bp: number | null;
+    bmi: number | null;
     chf: number;
     copd: number;
     diabetes: number;
     ckd: number;
-    lives_alone: number;
+    lives_alone: number | null;
     medications: string[];
   };
   risk: {
@@ -61,9 +61,12 @@ export interface ChatReply {
 }
 
 export interface Metrics {
+  source: string;
+  data_label: string;
   n_patients: number;
-  readmission_rate: number;
-  test_auroc: number;
+  observed_readmission_rate: number | null;
+  test_auroc: number | null;
+  updated_at: string;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
